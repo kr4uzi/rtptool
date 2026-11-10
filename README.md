@@ -5,6 +5,97 @@ Inspect, extract, and apply RTPatch `.rtp` binary patch files.
 > Licensed under [MIT](LICENSE). The RTPatch format is undocumented. The binary layout, codec, and opcode semantics were
 > reverse-engineered with Claude (Anthropic). See [SPEC.md](SPEC.md) for the full format description.
 
+## Supported formats
+
+- **0x0209 and earlier:** existing parsing and MODIFY behavior retained, with a
+  synthetic regression test. No independent legacy corpus was available here.
+- **0x0320:** the extra-entry layout observed in Battlefield 2's four 1.41 RTP
+  payloads. Supports HISTORY chains, intermediate source versions, inherited
+  descriptors, full-file ADD and DELETE. Unobserved framing/flag combinations
+  are rejected. See [SPEC-0x0320.md](SPEC-0x0320.md) for evidence and limits.
+
+For 0x0320, size, length accumulators and **both** rolling checksums select the
+history suffix and validate each destination. Already-final files are accepted;
+absent files can start at an ADD. ADD does not overwrite an unknown existing
+file. DELETE validates a present source; an absent final target is accepted.
+`--no-checksum` is available only for the legacy application path.
+
+## Battlefield 2
+
+The local owner-media acceptance passed: retail disc via the OpenBF2 probe
+reader → four 1.41 payloads via this Rust applier → 274 full 1.50 replacements →
+**125/125 probe gap paths matched the installed reference byte for byte**.
+All 1,167 compressed bodies decode exactly, all 148 ADD destinations pass their
+checksums, and all 1,019 MODIFY programs pass syntax/bounds validation.
+
+This is the stated gap-set acceptance, not a complete installer. Booster and
+Special Forces base files were unavailable. Full application attempts retain
+explicit diagnostics for those sources and eleven BF2 records outside the gap
+set, including historical/developer files and a DELETE checksum disagreement.
+Timestamp/attribute policy and opaque header integrity fields remain unresolved.
+No owner game bytes or patch payloads are included in this repository.
+
+### Applying and inspecting 0x0320
+
+```sh
+rtptool inspect patch.rtp --verbose
+rtptool list patch.rtp --type modify
+rtptool verify patch.rtp --programs
+rtptool apply patch.rtp --source ./disc-files --output ./patched-files
+```
+
+`list` expands histories into their operations. `extract` includes every
+compressed child, with its payload offset in the output filename. `verify`
+requires exact expanded length, a stream terminator and sub-byte padding, and
+checks ADD destinations. `--programs` also executes MODIFY programs against a
+synthetic zero source to check declared bounds and count opcodes; it does not
+claim content validation for those synthetic sources.
+
+The 0x0320 applier writes a separate staging tree of changed files. DELETE
+removes only staged output, never the source. Merge these changes with the base
+using the reported deletions, then overlay full replacement files. Application
+returns a failure status if any selected record cannot be produced. Paths are
+looked up without case sensitivity; traversal and symlinks are rejected for the
+staging-tree path. Payload memory usage can exceed 1 GiB for large archives.
+
+The library exposes `apply_record(&patch, &record, Option<&[u8]>)`, returning
+`Result<Option<Vec<u8>>, RtpError>`; `None` represents absence/deletion.
+`RtpPatch::operations()` expands HISTORY groups. `decode_record` returns a
+strictly decoded ADD file or MODIFY program. Legacy `patch_file` remains
+available and dispatches 0x0320 records through the strict applier.
+
+### Tests and local acceptance
+
+```sh
+cargo test --offline
+cargo test --offline --no-default-features
+```
+
+Synthetic tests generate their own fixtures. The owner-media integration test
+prints a skip message and returns without reading media unless all six input
+variables below are set. It imports the existing OpenBF2 reader and destination
+mapping from the supplied reader directory, checks that the report is exactly
+the current 125-path set, applies all four patches, overlays 1.50 and compares
+actual bytes. It also tests all starting points of a real five-step history and
+already-final input. Run in release mode for the large corpus:
+
+```sh
+export BF2_PATCH141='/path/to/BF2 Patch v. 1.0 - v. 1.41.exe'
+export BF2_ISO='/path/to/BF2 Image.iso'
+export BF2_PATCH150='/path/to/BF2 Patch v. 1.41 - v. 1.5.exe'
+export BF2_INSTALLED='/path/to/installed/Battlefield 2'
+export BF2_PROBE_READER='/path/to/OpenBF2/tools/macos/installer/formats.py'
+export BF2_GAP_REPORT='/path/to/OpenBF2/out/installer-probe/live-141-gap.json'
+cargo test --release --offline --test bf2_local -- --nocapture
+```
+
+Extraction is restricted to the a scratch directory you choose
+recorded in [BF2-0x0320-PROGRESS.md](BF2-0x0320-PROGRESS.md).
+`BF2_RTP_SCRATCH` can select a subdirectory of that root. The harness leaves
+per-product logs, reconstructed files, `acceptance.json`, and
+`latest-acceptance.json` there for inspection/resumption. Reference files are
+read-only and never used as patch sources.
+
 ## Build
 
 ```
@@ -66,7 +157,7 @@ $ rtptool list update.rtp --type new
 
 ---
 
-### `apply` — apply MODIFY patches
+### `apply` — apply patches (legacy examples below)
 
 ```
 rtptool apply <file.rtp> --source <dir> --output <dir> [options]
@@ -121,7 +212,7 @@ $ rtptool apply update.rtp --source ./v1.0 --output ./v1.1 --no-checksum
 
 ---
 
-### `extract` — extract compressed diffs or NEW-file metadata
+### `extract` — extract compressed bodies or legacy NEW-file metadata
 
 **Extract raw compressed diffs** (for debugging or re-use):
 

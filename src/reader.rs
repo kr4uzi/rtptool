@@ -15,7 +15,7 @@ impl<'a> Reader<'a> {
     }
 
     pub fn read_exact(&mut self, n: usize) -> Result<&'a [u8], RtpError> {
-        if self.pos + n > self.data.len() {
+        if n > self.remaining() {
             return Err(RtpError::UnexpectedEof {
                 offset: self.pos,
                 needed: n,
@@ -72,6 +72,9 @@ impl<'a> Reader<'a> {
             mask >>= 1;
         }
 
+        if count > 4 {
+            return Err(RtpError::InvalidFormat("unsupported VLI width".into()));
+        }
         let val = if count == 0 {
             b & 0x3F
         } else {

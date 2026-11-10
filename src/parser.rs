@@ -27,7 +27,11 @@ pub fn parse(data: Vec<u8>) -> Result<RtpPatch, RtpError> {
 
     let header = parse_header(&mut r)?;
     let dirs = parse_dir_table(&mut r, &header)?;
-    let records = parse_records(&mut r, &header)?;
+    let records = if header.version == 0x0320 {
+        crate::parser0320::records(&mut r, &header, &dirs)?
+    } else {
+        parse_records(&mut r, &header)?
+    };
 
     Ok(RtpPatch { header, dirs, records, raw: data })
 }
@@ -39,7 +43,7 @@ fn parse_header(r: &mut Reader<'_>) -> Result<RtpHeader, RtpError> {
     }
 
     let version = r.u16_le()?;
-    if version > 0x0209 {
+    if version > 0x0209 && version != 0x0320 {
         return Err(RtpError::UnsupportedVersion(version));
     }
 
@@ -53,13 +57,15 @@ fn parse_header(r: &mut Reader<'_>) -> Result<RtpHeader, RtpError> {
     }
 
     let extra_mode = (ext_type_flags >> 16) & 1 != 0;
-    let patch_total_size = r.u32_le()?;
-    let _reserved_a = r.u32_le()?;
+    let opaque = r.read_exact(if version == 0x0320 { 12 } else { 8 })?.to_vec();
+    let patch_total_size = if version == 0x0320 { 0 } else {
+        u32::from_le_bytes(opaque[..4].try_into().unwrap())
+    };
     let default_attrs = r.u16_le()?;
     let _reserved_b = r.u16_le()?;
     let cmd_flags = r.u16_le()?;
     let combine_mode_id = if cmd_flags & CMD_FLAG_COMBINE_ID != 0 { Some(r.u32_le()?) } else { None };
-    let _reserved_c = r.u32_le()?;
+    let reserved_tail = r.u32_le()?;
 
     Ok(RtpHeader {
         version,
@@ -67,6 +73,8 @@ fn parse_header(r: &mut Reader<'_>) -> Result<RtpHeader, RtpError> {
         ext_type_flags,
         option_flags,
         patch_total_size,
+        opaque,
+        reserved_tail,
         default_attrs,
         cmd_flags,
         combine_mode_id,
@@ -81,7 +89,7 @@ fn parse_dir_table(r: &mut Reader<'_>, hdr: &RtpHeader) -> Result<Vec<String>, R
     let n = r.u16_le()? as usize;
     let mut dirs = Vec::with_capacity(n);
     for _ in 0..n {
-        dirs.push(r.lp_string()?);
+        dirs.push(if hdr.version == 0x0320 { crate::parser0320::string(r)? } else { r.lp_string()? });
     }
     Ok(dirs)
 }
@@ -158,6 +166,7 @@ fn parse_records(r: &mut Reader<'_>, hdr: &RtpHeader) -> Result<Vec<FileRecord>,
             src_count,
             src_entries,
             dst_entries,
+            ..Default::default()
         });
 
         idx += 1;
@@ -241,7 +250,7 @@ fn read_entry(r: &mut Reader<'_>, extra_mode: bool) -> Result<EntryDescriptor, R
         r.read_exact(8)?;
         r.lp_string()?;
     }
-    Ok(EntryDescriptor { file_size, b0, b1, w1, w2 })
+    Ok(EntryDescriptor { file_size, b0, b1, w1, w2, ..Default::default() })
 }
 
 fn read_entries(

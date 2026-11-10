@@ -375,7 +375,44 @@ impl HuffTree {
         }
     }
 
-    fn decode(&mut self, bi: &mut BitIn, buf: &[u8]) -> Result<u16, String> {
+    // Canonical bit-at-a-time decoding avoids lookahead beyond a bounded stream.
+    fn decode_exact(&mut self, bi: &mut BitIn, buf: &[u8]) -> Result<u16, String> {
+        let lim = self.r32(0x10);
+        let mut val = 0;
+        for level in 0..self.r16u(0x04) as usize {
+            val = val * 2 + bi.bit(buf)? as u32;
+            let threshold = self.r16u(lim + level * 8);
+            if val < threshold { continue; }
+            let table = self.r32(self.r32(0x20) + level * 4);
+            let slot = table + (val - threshold) as usize * 4;
+            if slot + 4 > self.m.len() { return Err("invalid Huffman slot".into()); }
+            let p = self.r32(slot);
+            let base = self.r32(0x18);
+            let alpha = self.r16u(0x24) as usize;
+            if p < base || p > base + alpha * 2 || (p - base) % 2 != 0 {
+                return Err("invalid Huffman symbol".into());
+            }
+            let sym = (p - base) / 2;
+            if self.update_freq(sym) { self.rebuild(); self.build_limits(0); }
+            if sym == alpha {
+                let raw = bi.bits(self.r16u(6), buf)? as usize;
+                if self.r16u(base + raw * 2) != 0x8000 {
+                    return Err("duplicate Huffman escape".into());
+                }
+                let level = self.add_symbol(raw);
+                self.build_limits(level);
+                return Ok(raw as u16);
+            }
+            return Ok(sym as u16);
+        }
+        Err("invalid Huffman code".into())
+    }
+
+    fn decode(&mut self, bi: &mut BitIn, buf: &[u8], exact: bool) -> Result<u16, String> {
+        if exact { self.decode_exact(bi, buf) } else { self.decode_legacy(bi, buf) }
+    }
+
+    fn decode_legacy(&mut self, bi: &mut BitIn, buf: &[u8]) -> Result<u16, String> {
         if bi.pos >= bi.end {
             return Err("bitstream truncated".into());
         }
@@ -463,6 +500,18 @@ pub fn decompress(
     size: usize,
     max_output: usize,
 ) -> Result<Vec<u8>, String> {
+    decompress_inner(data, offset, size, max_output, false)
+}
+
+/// Require exact expanded length, distance-zero terminator and sub-byte padding.
+pub fn decompress_exact(data: &[u8], offset: usize, size: usize, expected: usize) -> Result<Vec<u8>, String> {
+    decompress_inner(data, offset, size, expected, true)
+}
+
+fn decompress_inner(data: &[u8], offset: usize, size: usize, max_output: usize, exact: bool) -> Result<Vec<u8>, String> {
+    if offset > data.len() || size > data.len() - offset {
+        return Err("compressed range outside payload".into());
+    }
     let end = if size > 0 { (offset + size).min(data.len()) } else { data.len() };
     if offset >= data.len() {
         return Err(format!("offset 0x{offset:x} beyond data length {}", data.len()));
@@ -479,6 +528,9 @@ pub fn decompress(
     let init_period = bi.bits(12, data).map_err(|e| e.to_string())?;
     let upd_period  = bi.bits(12, data).map_err(|e| e.to_string())?;
     let wflag       = bi.bits(4,  data).map_err(|e| e.to_string())?;
+    if exact && (init_period == 0 || upd_period == 0 || !matches!(wflag, 0 | 8) || use_raw > 1) {
+        return Err("unsupported compression options".into());
+    }
     let dist_bits   = if wflag == WINDOW_FLAG_8KB { 7u32 } else { 6 };
 
     let mut lit_tree  = if use_raw == 0 {
@@ -492,26 +544,28 @@ pub fn decompress(
     let mut out: Vec<u8> = Vec::with_capacity(max_output.min(1 << 20));
 
     loop {
-        if out.len() >= max_output { break; }
+        if !exact && out.len() >= max_output { break; }
 
         let flag = bi.bit(data).map_err(|e| e.to_string())?;
 
         if flag == 0 {
             let sym = if let Some(ref mut lt) = lit_tree {
-                lt.decode(&mut bi, data).map_err(|e| e.to_string())?
+                lt.decode(&mut bi, data, exact).map_err(|e| e.to_string())?
             } else {
                 bi.bits(8, data).map_err(|e| e.to_string())? as u16
             };
+            if exact && out.len() == max_output { return Err("expanded length exceeds declaration".into()); }
             out.push(sym as u8);
         } else {
             let dist_lo = bi.bits(dist_bits, data).map_err(|e| e.to_string())?;
-            let dist_hi = dist_tree.decode(&mut bi, data).map_err(|e| e.to_string())? as u32;
+            let dist_hi = dist_tree.decode(&mut bi, data, exact).map_err(|e| e.to_string())? as u32;
             let dist = (dist_hi << dist_bits) | dist_lo;
             if dist == 0 { break; }
-            let length = (len_tree.decode(&mut bi, data).map_err(|e| e.to_string())? & 0x7F) as usize;
+            let length = (len_tree.decode(&mut bi, data, exact).map_err(|e| e.to_string())? & 0x7F) as usize;
             let back = dist as usize + 1;
+            if exact && length > max_output - out.len() { return Err("expanded length exceeds declaration".into()); }
             for _ in 0..length {
-                if out.len() >= max_output { break; }
+                if !exact && out.len() >= max_output { break; }
                 let pos = out.len();
                 let byte = if pos >= back { out[pos - back] } else { 0 };
                 out.push(byte);
@@ -519,5 +573,84 @@ pub fn decompress(
         }
     }
 
+    if exact && (out.len() != max_output || (end - bi.pos) * 8 - (8 - bi.bl as usize) >= 8) {
+        return Err("expanded length mismatch or bytes after terminator".into());
+    }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bits(out: &mut Vec<bool>, width: usize, value: u32) {
+        for shift in (0..width).rev() {
+            out.push(value & (1 << shift) != 0);
+        }
+    }
+
+    // Synthetic canonical encoder, using the same frequency updates but deriving
+    // codes from group membership rather than exercising the decoder in reverse.
+    fn symbol(tree: &mut HuffTree, out: &mut Vec<bool>, value: usize) {
+        let base = tree.r32(0x18);
+        let escaped = tree.r16u(base + value * 2) == 0x8000;
+        let target = if escaped { tree.r16u(0x24) as usize } else { value };
+        let lim = tree.r32(0x10);
+        let mut found = false;
+        for level in 0..tree.r16u(4) as usize {
+            let table = tree.r32(tree.r32(0x20) + level * 4);
+            let count = tree.r16u(tree.r32(0x0c) + level * 2) as usize;
+            for slot in 0..count {
+                if tree.r32(table + slot * 4) == base + target * 2 {
+                    bits(out, level + 1, tree.r16u(lim + level * 8) + slot as u32);
+                    found = true;
+                    break;
+                }
+            }
+            if found { break; }
+        }
+        assert!(found);
+        if tree.update_freq(target) {
+            tree.rebuild();
+            tree.build_limits(0);
+        }
+        if escaped {
+            bits(out, tree.r16u(6) as usize, value as u32);
+            let level = tree.add_symbol(value);
+            tree.build_limits(level);
+        }
+    }
+
+    #[test]
+    fn synthetic_adaptive_rebuild_and_overlapping_lz_match() {
+        let mut stream = Vec::new();
+        for (width, value) in [(16, 0xb59c), (8, 0), (8, 255), (12, 64), (12, 16), (4, 8)] {
+            bits(&mut stream, width, value);
+        }
+        let mut literals = HuffTree::new(8, 16, 64, 16);
+        let mut lengths = HuffTree::new(6, 12, 64, 16);
+        let mut distances = HuffTree::new(6, 12, 64, 16);
+        let mut expected = Vec::new();
+        for i in 0..600 {
+            let value = ((i * 37) % 256) as u8;
+            bits(&mut stream, 1, 0);
+            symbol(&mut literals, &mut stream, value as usize);
+            expected.push(value);
+        }
+        bits(&mut stream, 1, 1);
+        bits(&mut stream, 7, 2); // distance 2 -> copy from three bytes back
+        symbol(&mut distances, &mut stream, 0);
+        symbol(&mut lengths, &mut stream, 30);
+        for _ in 0..30 {
+            expected.push(expected[expected.len() - 3]);
+        }
+        bits(&mut stream, 1, 1);
+        bits(&mut stream, 7, 0);
+        symbol(&mut distances, &mut stream, 0);
+        let bytes: Vec<u8> = stream.chunks(8).map(|chunk| {
+            chunk.iter().enumerate().fold(0, |v, (i, b)| v | ((*b as u8) << (7 - i)))
+        }).collect();
+        assert_eq!(decompress_exact(&bytes, 0, bytes.len(), expected.len()).unwrap(), expected);
+        assert!(decompress_exact(&bytes, 0, bytes.len(), expected.len() - 1).is_err());
+    }
 }
