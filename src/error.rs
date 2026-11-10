@@ -2,10 +2,12 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RtpError {
+    #[error("invalid patch: {0}")]
+    InvalidFormat(String),
     #[error("invalid magic: expected 4b 2a, got {0:02x?}")]
     InvalidMagic(Vec<u8>),
 
-    #[error("unsupported version 0x{0:04x} (max 0x0209)")]
+    #[error("unsupported version 0x{0:04x} (supported: <= 0x0209 and 0x0320)")]
     UnsupportedVersion(u16),
 
     #[error("unsupported ext_type_flags 0x{0:08x}: low 3 bits must be zero")]

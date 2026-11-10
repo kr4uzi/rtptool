@@ -81,7 +81,7 @@ impl<'a> OpcodeReader<'a> {
     }
 
     fn bytes(&mut self, n: usize) -> Result<&'a [u8], &'static str> {
-        if self.pos + n > self.data.len() {
+        if n > self.data.len() - self.pos {
             return Err("opcode stream truncated");
         }
         let s = &self.data[self.pos..self.pos + n];
@@ -98,6 +98,7 @@ impl<'a> OpcodeReader<'a> {
             count += 1;
             mask >>= 1;
         }
+        if count > 4 { return Err("unsupported VLI width"); }
         let val = if count == 0 {
             b & 0x3F
         } else {
@@ -127,8 +128,23 @@ pub fn apply(
     dest_size: usize,
     src_count: i64,
 ) -> Result<Vec<u8>, RtpError> {
-    run_opcodes(src_data, opcodes, dest_size, src_count)
+    run_opcodes(src_data, opcodes, dest_size, src_count, false, None)
         .map_err(|e| RtpError::ApplyError { filename: String::new(), detail: e })
+}
+
+/// Strict 0x0320 opcode execution. Never clips reads or grows the destination.
+pub fn apply_exact(src: &[u8], opcodes: &[u8], dest_size: usize) -> Result<Vec<u8>, RtpError> {
+    run_opcodes(src, opcodes, dest_size, 1, true, None)
+        .map_err(|detail| RtpError::ApplyError { filename: String::new(), detail })
+}
+
+/// Check a single-source program against declared bounds, counting opcodes.
+/// Uses synthetic zero source bytes; this is syntax validation, not a content check.
+pub fn validate_program(opcodes: &[u8], source_size: usize, dest_size: usize) -> Result<[u64; 23], RtpError> {
+    let mut counts = [0; 23];
+    run_opcodes(&vec![0; source_size], opcodes, dest_size, 1, true, Some(&mut counts))
+        .map_err(|detail| RtpError::ApplyError { filename: String::new(), detail })?;
+    Ok(counts)
 }
 
 fn run_opcodes(
@@ -136,6 +152,8 @@ fn run_opcodes(
     opcodes: &[u8],
     dest_size: usize,
     src_count: i64,
+    strict: bool,
+    mut counts: Option<&mut [u64; 23]>,
 ) -> Result<Vec<u8>, String> {
     let mut r = OpcodeReader::new(opcodes);
     let mut output = vec![0u8; dest_size];
@@ -144,52 +162,61 @@ fn run_opcodes(
     let mut gaps: Vec<(usize, usize)> = Vec::new();
     let mut templates: Vec<(usize, usize)> = Vec::new();
 
-    fn grow(output: &mut Vec<u8>, n: usize) {
+    fn grow(output: &mut Vec<u8>, n: usize, strict: bool) -> Result<(), String> {
         if n > output.len() {
+            if strict { return Err("write outside destination".into()); }
             output.resize(n, 0);
         }
+        Ok(())
     }
 
     fn do_copy(src: &[u8], output: &mut Vec<u8>, out_pos: &mut usize,
-               gaps: &mut Vec<(usize, usize)>, advance: usize, src_off: usize, cnt: usize) {
+               gaps: &mut Vec<(usize, usize)>, advance: usize, src_off: usize, cnt: usize, strict: bool) -> Result<(), String> {
+        if strict && (src_off > src.len() || cnt > src.len() - src_off) { return Err("COPY outside source".into()); }
+        if advance > output.len().saturating_sub(*out_pos) && strict { return Err("gap outside destination".into()); }
         if advance > 0 {
             gaps.push((*out_pos, advance));
             *out_pos += advance;
         }
-        grow(output, *out_pos + cnt);
+        grow(output, out_pos.checked_add(cnt).ok_or("output offset overflow")?, strict)?;
         let src_end = (src_off + cnt).min(src.len());
         let copy_len = src_end.saturating_sub(src_off);
         if copy_len > 0 {
             output[*out_pos..*out_pos + copy_len].copy_from_slice(&src[src_off..src_end]);
         }
         *out_pos += cnt;
+        Ok(())
     }
 
     fn do_fill(output: &mut Vec<u8>, out_pos: &mut usize, gaps: &mut Vec<(usize, usize)>,
-               seek: usize, pattern: &[u8], count: usize) {
+               seek: usize, pattern: &[u8], count: usize, strict: bool) -> Result<(), String> {
+        if strict && seek > output.len().saturating_sub(*out_pos) { return Err("gap outside destination".into()); }
         if seek > 0 {
             gaps.push((*out_pos, seek));
             *out_pos += seek;
         }
-        grow(output, *out_pos + count);
-        if !pattern.is_empty() && pattern.iter().any(|&b| b != 0) {
+        grow(output, out_pos.checked_add(count).ok_or("output offset overflow")?, strict)?;
+        if strict && (pattern.is_empty() || pattern.iter().all(|&b| b == 0)) {
+            output[*out_pos..*out_pos + count].fill(0);
+        } else if !pattern.is_empty() && pattern.iter().any(|&b| b != 0) {
             let plen = pattern.len();
             for i in 0..count {
                 output[*out_pos + i] = pattern[i % plen];
             }
         }
         *out_pos += count;
+        Ok(())
     }
 
-    fn poke_delta(output: &mut Vec<u8>, pos: i64, width: usize, delta: i64) {
-        if pos < 0 { return; }
+    fn poke_delta(output: &mut Vec<u8>, pos: i64, width: usize, delta: i64, strict: bool) -> Result<(), String> {
+        if pos < 0 { return if strict { Err("negative poke position".into()) } else { Ok(()) }; }
         let p = pos as usize;
-        grow(output, p + width);
+        grow(output, p.checked_add(width).ok_or("poke position overflow")?, strict)?;
         let cur: i64 = match width {
             1 => output[p] as i64,
             2 => i16::from_le_bytes(output[p..p+2].try_into().unwrap()) as i64,
             4 => i32::from_le_bytes(output[p..p+4].try_into().unwrap()) as i64,
-            _ => return,
+            _ => return Err("invalid poke width".into()),
         };
         let v = cur.wrapping_add(delta);
         match width {
@@ -198,17 +225,25 @@ fn run_opcodes(
             4 => output[p..p+4].copy_from_slice(&(v as i32).to_le_bytes()),
             _ => {}
         }
+        Ok(())
     }
 
     fn s8(b: u8) -> i64 { if b >= 128 { b as i64 - 256 } else { b as i64 } }
 
+    let mut ended = false;
     while let Some(op_result) = r.next_opcode() {
         let op = op_result?;
+        if let Some(ref mut counts) = counts { counts[op as usize] += 1; }
         match op {
-            Opcode::End => break,
+            Opcode::End => {
+                if strict && (r.pos != opcodes.len() || !gaps.is_empty()) { return Err("unconsumed opcodes or literal gaps".into()); }
+                ended = true;
+                break;
+            },
 
             Opcode::SetSource => {
-                let _src_idx = r.vli().map_err(|e| e.to_string())?;
+                let src_idx = r.vli().map_err(|e| e.to_string())?;
+                if strict && src_idx != 0 { return Err("source index out of range".into()); }
                 out_pos = 0;
                 poke_pos = 0;
             }
@@ -220,7 +255,7 @@ fn run_opcodes(
                 let _src_idx = if src_count >= 2 { r.vli().map_err(|e| e.to_string())? } else { 0 };
                 let src_off = r.vli().map_err(|e| e.to_string())? as usize;
                 let cnt = r.vli().map_err(|e| e.to_string())? as usize;
-                do_copy(src, &mut output, &mut out_pos, &mut gaps, advance, src_off, cnt);
+                do_copy(src, &mut output, &mut out_pos, &mut gaps, advance, src_off, cnt, strict)?;
             }
 
             Opcode::Flush => {
@@ -228,7 +263,7 @@ fn run_opcodes(
                     gaps.push((out_pos, dest_size - out_pos));
                 }
                 for &(off, ln) in &gaps {
-                    grow(&mut output, off + ln);
+                    grow(&mut output, off + ln, strict)?;
                     let bytes = r.bytes(ln).map_err(|e| e.to_string())?;
                     output[off..off + ln].copy_from_slice(bytes);
                 }
@@ -239,7 +274,7 @@ fn run_opcodes(
                 let seek = r.vli().map_err(|e| e.to_string())?;
                 let delta = s8(r.byte().map_err(|e| e.to_string())?);
                 poke_pos += seek;
-                poke_delta(&mut output, poke_pos, 1, delta);
+                poke_delta(&mut output, poke_pos, 1, delta, strict)?;
             }
 
             Opcode::Poke1xN | Opcode::Poke1xNB => {
@@ -248,7 +283,7 @@ fn run_opcodes(
                 let count = r.vli().map_err(|e| e.to_string())? as usize;
                 for _ in 0..count {
                     poke_pos += r.vli().map_err(|e| e.to_string())?;
-                    poke_delta(&mut output, poke_pos, 1, delta);
+                    poke_delta(&mut output, poke_pos, 1, delta, strict)?;
                 }
             }
 
@@ -256,6 +291,7 @@ fn run_opcodes(
                 let _src_idx = if src_count >= 2 { r.vli().map_err(|e| e.to_string())? } else { 0 };
                 let src_off = r.vli().map_err(|e| e.to_string())? as usize;
                 let cnt = r.vli().map_err(|e| e.to_string())? as usize;
+                if strict && (src_off > src.len() || cnt > src.len() - src_off) { return Err("STORE outside source".into()); }
                 templates.push((src_off, cnt));
             }
 
@@ -266,7 +302,7 @@ fn run_opcodes(
                 let idx = r.vli().map_err(|e| e.to_string())? as usize;
                 let &(src_off, cnt) = templates.get(idx)
                     .ok_or_else(|| format!("TCOPY: template index {idx} out of range"))?;
-                do_copy(src, &mut output, &mut out_pos, &mut gaps, advance, src_off, cnt);
+                do_copy(src, &mut output, &mut out_pos, &mut gaps, advance, src_off, cnt, strict)?;
             }
 
             Opcode::Zfill | Opcode::ZfillGap => {
@@ -274,7 +310,7 @@ fn run_opcodes(
                     r.vli().map_err(|e| e.to_string())? as usize
                 } else { 0 };
                 let count = r.vli().map_err(|e| e.to_string())? as usize;
-                do_fill(&mut output, &mut out_pos, &mut gaps, seek, &[], count);
+                do_fill(&mut output, &mut out_pos, &mut gaps, seek, &[], count, strict)?;
             }
 
             Opcode::Poke1xNVar => {
@@ -283,7 +319,7 @@ fn run_opcodes(
                 for _ in 0..count {
                     poke_pos += r.vli().map_err(|e| e.to_string())?;
                     let delta = s8(r.byte().map_err(|e| e.to_string())?);
-                    poke_delta(&mut output, poke_pos, 1, delta);
+                    poke_delta(&mut output, poke_pos, 1, delta, strict)?;
                 }
             }
 
@@ -295,7 +331,7 @@ fn run_opcodes(
                 let count = r.vli().map_err(|e| e.to_string())? as usize;
                 for _ in 0..count {
                     poke_pos += r.vli().map_err(|e| e.to_string())?;
-                    poke_delta(&mut output, poke_pos, 2, delta);
+                    poke_delta(&mut output, poke_pos, 2, delta, strict)?;
                 }
             }
 
@@ -307,7 +343,7 @@ fn run_opcodes(
                 let count = r.vli().map_err(|e| e.to_string())? as usize;
                 for _ in 0..count {
                     poke_pos += r.vli().map_err(|e| e.to_string())?;
-                    poke_delta(&mut output, poke_pos, 4, delta);
+                    poke_delta(&mut output, poke_pos, 4, delta, strict)?;
                 }
             }
 
@@ -317,7 +353,7 @@ fn run_opcodes(
                 } else { 0 };
                 let pat = r.bytes(1).map_err(|e| e.to_string())?.to_vec();
                 let count = r.vli().map_err(|e| e.to_string())? as usize;
-                do_fill(&mut output, &mut out_pos, &mut gaps, seek, &pat, count);
+                do_fill(&mut output, &mut out_pos, &mut gaps, seek, &pat, count, strict)?;
             }
 
             Opcode::Fill2 | Opcode::Fill2Gap => {
@@ -326,7 +362,7 @@ fn run_opcodes(
                 } else { 0 };
                 let pat = r.bytes(2).map_err(|e| e.to_string())?.to_vec();
                 let count = r.vli().map_err(|e| e.to_string())? as usize;
-                do_fill(&mut output, &mut out_pos, &mut gaps, seek, &pat, count);
+                do_fill(&mut output, &mut out_pos, &mut gaps, seek, &pat, count, strict)?;
             }
 
             Opcode::Fill4 | Opcode::Fill4Gap => {
@@ -335,11 +371,12 @@ fn run_opcodes(
                 } else { 0 };
                 let pat = r.bytes(4).map_err(|e| e.to_string())?.to_vec();
                 let count = r.vli().map_err(|e| e.to_string())? as usize;
-                do_fill(&mut output, &mut out_pos, &mut gaps, seek, &pat, count);
+                do_fill(&mut output, &mut out_pos, &mut gaps, seek, &pat, count, strict)?;
             }
         }
     }
 
+    if strict && !ended { return Err("missing END opcode".into()); }
     output.truncate(dest_size);
     Ok(output)
 }
